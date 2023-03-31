@@ -1,0 +1,77 @@
+data:
+    dataset: "CIFAR10"
+    category: "lmdb"
+    image_size: 32
+    num_channels: 3
+    random_flip: True
+    centered: True
+    uniform_dequantization: False
+    datapath: ../diffusion_distillation/data/cifar_origin/quad/lmdb
+    dir_type: folder
+    num_sample: -1 
+    epsilon: 0.0
+    shape: [3, 17, 32, 32]
+    dims: [1, 0, 2, 3]
+    num_steps: 512
+    t_dim: 17
+    t_idx: [0, 4, 8, 12, 16]
+    time_step: quad
+
+model:
+    logsnr_min: -20.
+    logsnr_max: 20.
+    num_scales: 1000
+    dropout: 0.2
+    name: 'ddpmm'
+    num_classes: 0
+    ema_rate: 0.9999
+    normalization: 'GroupNorm'
+    nonlinearity: 'swish'
+    nf: 256
+    temb_dim: 1024
+    ch_mult: [1, 1, 1]  # (1, 2, 2, 2)
+    num_res_blocks: 3
+    attn_resolutions: [8, 16]  # (16,)
+    num_attn_heads: 1
+    resamp_with_conv: False
+    conditional: True
+    resblock_type: 'biggan'
+    init_scale: 0.
+    logsnr_type: inv_cos
+    fourier_feature: False
+    mean_type: x
+    time_conv: True
+    with_nin: False
+    num_modes: 2
+    pred_eps: False
+    num_t: 4
+    num_pad: 0
+    loss_weight: snr
+
+training:
+    start_iter: 0
+    n_iters: 400_001
+    batchsize: 32
+    loss: vgg
+    lpips: False
+    init_ckpt: '../diffusion_distillation/ckpts/cifar_original' 
+
+eval:
+    save_step: 10000
+    test_fid: True
+
+optim:
+    optimizer: 'Adam'
+    lr: 0.0002  # 2e-4
+    beta1: 0.9
+    beta2: 0.999
+    eps: 0.00000001  # 1e-8
+    milestone: [100_000, 200_000, 300_000]
+    warmup: 10000
+    grad_clip: 0.0
+
+log:
+    logname: cifar-tddpmm-t4-quad-snr10000-256-vgg-nocal
+    entity: hzzheng
+    project: DiffusionModel-CIFAR10-NewExp
+    group: TDPPMm-t4-quad-snr-256-vgg-nocal
