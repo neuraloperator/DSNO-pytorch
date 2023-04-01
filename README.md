@@ -46,11 +46,13 @@ python3 generate_imagenet.py --config configs/imagenet64-dsno-t4.yaml --ckpt [pa
 │   Dockerfile
 │   README.md
 │   train_cifar.py
-│   train_cond.py
+│   train_imagenet.py
+|   generate_imagenet.py          # example of class-conditional generation
+|   generate_cifar.py             # example of unconditional generation
 │   
 ├───configs
-│       cifar10-dsno-t4.yaml      # example for unconditional dsno on cifar10
-│       imagenet64-dsno-t4.yaml   # example for class-conditional dsno on ImageNet64
+│       cifar10-dsno-t4.yaml      # example of configuration file for unconditional dsno on cifar10
+│       imagenet64-dsno-t4.yaml   # example of configuration file for class-conditional dsno on ImageNet64
 │       
 ├───models
 │       layers.py
