@@ -71,7 +71,7 @@ optim:
     grad_clip: 0.0
 
 log:
-    logname: cifar-tddpmm-t4-quad-snr10000-256-vgg-nocal
+    logname: cifar-tddpmm-t4-quad-256-vgg-nocal
     entity: hzzheng
     project: DiffusionModel-CIFAR10-NewExp
     group: TDPPMm-t4-quad-snr-256-vgg-nocal

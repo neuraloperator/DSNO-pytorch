@@ -1,0 +1,79 @@
+data:
+    dataset: imagenet
+    category: imagenet
+    image_size: 64
+    num_channels: 3
+    random_flip: True
+    centered: True
+    datapath: ../diffusion_distillation/data/imagenet16_data
+    shape: [3, 9, 64, 64]
+    dims: [1, 0, 2, 3]
+    t_dim: 9
+    t_idx: [0, 2, 4, 6, 8]
+    num_steps: 16
+    time_step: uniform
+    epsilon: 0.0
+
+model:
+    logsnr_min: -20.
+    logsnr_max: 20.
+    num_scales: 1000
+    dropout: 0.1
+    name: 'tddpmm'
+    ema_rate: 0.9999
+    normalization: 'GroupNorm'
+    nonlinearity: 'swish'
+    nf: 192
+    temb_dim: 768
+    ch_mult: [1, 2, 3, 4]
+    num_res_blocks: 3
+    attn_resolutions: [8, 16, 32]
+    head_dim: 64
+    resamp_with_conv: False
+    conditional: True
+    num_classes: 1000
+    resblock_type: 'biggan'
+    init_scale: 0.
+    logsnr_type: inv_cos
+    mean_type: x
+    time_conv: True
+    with_nin: False
+    num_modes: 2
+    pred_eps: False 
+    num_t: 4
+    num_pad: 0
+    loss_weight: snr
+    fourier_feature: False
+
+training:
+    start_iter: 0
+    n_iters: 480_001
+    batchsize: 8  #  batchsize on each GPU, total batchsize = batchsize * num_gpus * accum_grad_iter
+    accum_grad_iter: 4
+    loss: L1
+    loss_weight: snr
+    init_ckpt: '../diffusion_distillation/ckpts/imagenet_16' 
+
+eval:
+    save_step: 3_000
+    test_fid: False
+
+optim:
+    optimizer: 'Adam'
+    lr: 0.0002  # 2e-4
+    weight_decay: 0.0
+    milestone: [200_000, 400_000, 600_000, 800_000]
+    warmup: 10_000
+    grad_clip: 0.0
+
+log:
+    logname: Imagenet-TDDPMm-snr-t4-amp-bx8
+    entity: hzzheng
+    project: DiffusionModel-ImageNet
+    group: Imagenet-TDDPMm-snr-t4-amp-bx8
+
+sample:
+    batchsize: 50
+    num_batchs: 100
+    num_steps: 8
+    clip_x: False

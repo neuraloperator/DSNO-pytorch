@@ -6,11 +6,11 @@ import random
 from argparse import ArgumentParser
 import copy
 from functools import partial
+from omegaconf import OmegaConf
 
-import numpy as np
 import torch
 import torch.multiprocessing as mp
-import yaml
+
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam, RAdam
 from torch.optim.lr_scheduler import MultiStepLR, LinearLR, ChainedScheduler
@@ -24,7 +24,7 @@ from models.utils import save_ckpt, load_from_jax_ckpt
 from utils.data_helper import data_sampler, sample_data
 from utils.dataset import LMDBData
 from utils.distributed import setup, cleanup, reduce_loss_dict
-from utils.helper import count_params, dict2namespace
+from utils.helper import count_params, prepare_pretrain_file
 from utils.loss import weightedL1, weightedL2, percepLoss
 
 import lpips
@@ -51,31 +51,31 @@ def train(model, model_ema,
           device, config, args,
           rank=0):
     # get configuration
-    logsnr_min = config['model']['logsnr_min']
-    logsnr_max = config['model']['logsnr_max']
-    loss_weight = config['model']['loss_weight']
+    logsnr_min = config.model.logsnr_min
+    logsnr_max = config.model.logsnr_max
+    loss_weight = config.model.loss_weight
 
-    grad_clip = config['optim']['grad_clip']
-    t_dim = config['data']['t_dim']
-    t_idx = config['data']['t_idx']
-    num_steps = config['data']['num_steps']
+    grad_clip = config.optim.grad_clip
+    t_dim = config.data.t_dim
+    t_idx = config.data.t_idx
+    num_steps = config.data.num_steps
 
-    ema_decay = config['model']['ema_rate']
-    start_iter = config['training']['start_iter']
+    ema_decay = config.model.ema_rate
+    start_iter = config.training.start_iter
 
-    target_num_t = config['model']['num_t'] # number of time steps to predict
-    num_pad = config['model']['num_pad']    # number of steps for padding (Fourier continuation)
+    target_num_t = config.model.num_t # number of time steps to predict
+    num_pad = config.model.num_pad    # number of steps for padding (Fourier continuation)
     total_num_t = target_num_t + num_pad    # number of total time steps
 
-    logname = config['log']['logname']
-    save_step = config['eval']['save_step']
-    use_wandb = config['use_wandb'] if 'use_wandb' in config else False
+    logname = config.log.logname
+    save_step = config.eval.save_step
+    use_wandb = config.use_wandb if 'use_wandb' in config else False
     # setup wandb
     if use_wandb and wandb:
-        run = wandb.init(entity=config['log']['entity'],
-                         project=config['log']['project'],
-                         group=config['log']['group'],
-                         config=config,
+        run = wandb.init(entity=config.log.entity,
+                         project=config.log.project,
+                         group=config.log.group,
+                         config=config.to_container(),
                          reinit=True,
                          settings=wandb.Settings(start_method='fork'))
 
@@ -90,21 +90,22 @@ def train(model, model_ema,
     # prepare time input
     logsnr_fn = get_logsnr_schedule(logsnr_max, logsnr_min)
 
-    t0, t1 = 1., config['data']['epsilon']
+    t0, t1 = 1., config.data.epsilon
     timesteps = torch.linspace(t0, t1, num_steps + 1, device=device)
     idxs = get_idx(t_idx=t_idx, t_dim=t_dim, num_steps=num_steps, 
-                   time_step=config['data']['time_step'])
+                   time_step=config.data.time_step)
 
     timesteps = timesteps[idxs[-total_num_t:]]
     logsnr = logsnr_fn(timesteps)
     # define loss function
-    loss_type = config['training']['loss']
+    loss_type = config.training.loss
     if loss_type == 'L1':
         criterion = weightedL1
     elif loss_type == 'L2':
         criterion = weightedL2
     else:
-        loss_fn = lpips.LPIPS(net=loss_type, lpips=config['training']['lpips']).cuda()
+        # perceptual loss, VGG-based versions works the best. 
+        loss_fn = lpips.LPIPS(net=loss_type, lpips=config.training.lpips).cuda()
         criterion = partial(percepLoss, loss_fn=loss_fn)
 
     # compute loss weighting
@@ -112,13 +113,12 @@ def train(model, model_ema,
         weights = torch.sqrt(torch.exp(logsnr)).clamp(1.0, 10000.0)
     else:
         weights = torch.ones_like(logsnr, device=device)
-        # print('Default uniform loss weighting')
-    # print(weights)
+
     # training
     if rank == 0:
-        pbar = tqdm(range(start_iter, config['training']['n_iters']), dynamic_ncols=True)
+        pbar = tqdm(range(start_iter, config.training.n_iters), dynamic_ncols=True)
     else:
-        pbar = range(start_iter, config['training']['n_iters'])
+        pbar = range(start_iter, config.training.n_iters)
     log_dict = {}
     dataloader = sample_data(dataloader)
 
@@ -128,18 +128,18 @@ def train(model, model_ema,
         # B, T, C, H, W
         states = states.to(device)
 
-        in_state = states[:, 0]
-        target_state = states[:, -target_num_t:]
+        in_state = states[:, 0]                     # (B, C, H, W) Gaussian noise
+        target_state = states[:, -target_num_t:]    # (B, T-1, C, H, W) target trajectory
 
-        pred = model(in_state, logsnr)
-        target_pred = pred[:, -target_num_t:]
+        pred = model(in_state, logsnr)              # (B, T-1, C, H, W) output trajectory
+        target_pred = pred[:, -target_num_t:]       # (B, T-1, C, H, W) predicted trajectory. This line does not change anything, just for future flexibility in case we want to add Fourier continuation.
 
         loss, loss_ts  = criterion(target_pred, target_state, weights)
         # update model
         model.zero_grad()
 
         loss.backward()
-        if grad_clip > 0.0:
+        if grad_clip > 0.0:     # gradient clipping is not necessary for training dsno, but we keep it here as an additional option. 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
         log_dict['train_loss'] = loss
@@ -164,9 +164,7 @@ def train(model, model_ema,
             for b_ema, b in zip(model_ema.buffers(), model.buffers()):
                 b_ema.copy_(b)
 
-        if e % save_step == 0:
-            # memory_use = psutil.Process().memory_info().rss / (1024 * 1024)
-            # print(f'Step {e}; Memory usage: {memory_use} MB')
+        if e % save_step == 0 and e > 0:
             if rank == 0:
                 save_path = os.path.join(save_ckpt_dir,
                                          f'solver-model_{e}.pt')
@@ -177,7 +175,7 @@ def train(model, model_ema,
             
             # generate 50k images to save_img_dir for evaluation
             # torch.distributed.barrier()
-            # if config['eval']['test_fid'] and e > 0 and rank == 0:
+            # if config.eval.test_fid and e > 0 and rank == 0:
             #     fid_score = compute_fid(model_ema, temb=logsnr)
             #     log_state['FID'] = fid_score
         if use_wandb and wandb:
@@ -196,14 +194,14 @@ def train(model, model_ema,
 def run(train_loader,
         config, args, device, rank=0):
     # create model
-    model_args = dict2namespace(config)
-
-    model = TDDPMm(model_args).to(device)
-    if 'init_ckpt' in config['training']:
-        ckpt_path = config['training']['init_ckpt']
+    model = TDDPMm(config).to(device)
+    if 'init_ckpt' in config.training:  
+        # initialize UNet part from pre-trained model
+        ckpt_path = config.training.init_ckpt
+        prepare_pretrain_file(ckpt_path)
         with open(ckpt_path, 'rb') as f:
             ckpt = serialization.from_bytes(target=None, encoded_bytes=f.read())['ema_params']
-            load_from_jax_ckpt(model, ckpt, model_args)
+            load_from_jax_ckpt(model, ckpt, config)
 
     model_ema = copy.deepcopy(model)
     model_ema.eval()
@@ -214,14 +212,14 @@ def run(train_loader,
     config['num_params'] = num_params
 
     # define optimizer and criterion
-    if config['optim']['optimizer'] == 'Adam':
-        optimizer = Adam(model.parameters(), lr=config['optim']['lr'], 
-                         betas=(config['optim']['beta1'], config['optim']['beta2']))
-    elif config['optim']['optimizer'] == 'RAdam':
-        optimizer = RAdam(model.parameters(), lr=config['optim']['lr'])
-    scheduler1 = LinearLR(optimizer, start_factor=0.001, total_iters=config['optim']['warmup'])
+    if config.optim.optimizer == 'Adam':
+        optimizer = Adam(model.parameters(), lr=config.optim.lr, 
+                         betas=(config.optim.beta1, config.optim.beta2))
+    elif config.optim.optimizer == 'RAdam':
+        optimizer = RAdam(model.parameters(), lr=config.optim.lr)
+    scheduler1 = LinearLR(optimizer, start_factor=0.001, total_iters=config.optim.warmup)
     scheduler2 = MultiStepLR(optimizer,
-                             milestones=config['optim']['milestone'],
+                             milestones=config.optim.milestone,
                              gamma=0.5)
     scheduler = ChainedScheduler([scheduler1, scheduler2])
 
@@ -235,7 +233,7 @@ def run(train_loader,
         print(f'Load optimizer state..')
         scheduler.load_state_dict(ckpt['scheduler'])
         print(f'Load scheduler state..')
-        config['training']['start_iter'] = scheduler._schedulers[0].last_epoch
+        config.training.start_iter = scheduler._schedulers[0].last_epoch
 
     if args.distributed:
         model = DDP(model, device_ids=[rank], broadcast_buffers=False)
@@ -252,34 +250,34 @@ def subprocess_fn(rank, args):
         setup(rank, args.num_gpus, port=f'{args.port}')
     print(f'Running on rank: {rank}')
 
-    with open(args.config, 'r') as f:
-        config = yaml.load(f, yaml.FullLoader)
+    config = OmegaConf.load(args.config)
     # parse configuration file
     torch.cuda.set_device(rank)
     device = torch.device('cuda')
-    batchsize = config['training']['batchsize']
-    if config['data']['num_sample'] == -1:
+    batchsize = config.training.batchsize
+    if config.data.num_sample == -1:
+        # use all data in the database
         num_data = None
     else:
-        num_data = config['data']['num_sample']
+        num_data = config.data.num_sample
         
     if args.log and rank == 0:
-        config['use_wandb'] = True
+        config.use_wandb = True
     else:
-        config['use_wandb'] = False
+        config.use_wandb = False
 
-    config['seed'] = args.seed
+    config.seed = args.seed
     seed = args.seed
     torch.manual_seed(seed)
     random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    db_path = config['data']['datapath']
+    db_path = config.data.datapath
     trainset = LMDBData(db_path, 
-                        data_shape=config['data']['shape'],
-                        dims=config['data']['dims'],  
-                        t_idx=config['data']['t_idx'], 
+                        data_shape=config.data.shape,
+                        dims=config.data.dims,  
+                        t_idx=config.data.t_idx, 
                         num_data=num_data)
 
     train_loader = DataLoader(trainset, batch_size=batchsize,
@@ -299,7 +297,7 @@ def subprocess_fn(rank, args):
 
 
 if __name__ == '__main__':
-    torch.backend.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = True
     parser = ArgumentParser(description='Basic parser')
     parser.add_argument('--config', type=str, default='configs/cifar/tunet.yaml', help='configuration file')
     parser.add_argument('--ckpt', type=str, default=None, help='Which checkpoint to initialize the model')

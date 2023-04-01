@@ -5,10 +5,10 @@ import os
 import random
 from argparse import ArgumentParser
 import copy
+from omegaconf import OmegaConf
 
 import torch
 import torch.multiprocessing as mp
-import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import MultiStepLR, LinearLR, ChainedScheduler
@@ -23,10 +23,15 @@ from models.utils import save_ckpt, load_from_jax_ckpt
 from utils.data_helper import data_sampler, sample_data
 from utils.dataset import ImageNet
 from utils.distributed import setup, cleanup, reduce_loss_dict
-from utils.helper import count_params, dict2namespace, get_latest_ckpt
-from utils.loss import weightedL1, weightedL2
+from utils.helper import count_params, get_latest_ckpt, prepare_pretrain_file
+from utils.loss import weightedL1, weightedL2, percepLoss
 
-import apex
+import lpips
+
+try:
+    import apex
+except ImportError:
+    apex = None
 
 try:
     import wandb
@@ -50,33 +55,33 @@ def train(model, model_ema,
           device, config, args,
           rank=0):
     # get configuration
-    logsnr_min = config['model']['logsnr_min']
-    logsnr_max = config['model']['logsnr_max']
-    loss_weight = config['model']['loss_weight']
+    logsnr_min = config.model.logsnr_min
+    logsnr_max = config.model.logsnr_max
+    loss_weight = config.model.loss_weight
 
-    grad_clip = config['optim']['grad_clip']
-    t_dim = config['data']['t_dim']
-    t_idx = config['data']['t_idx']
-    num_steps = config['data']['num_steps']
+    grad_clip = config.optim.grad_clip
+    t_dim = config.data.t_dim
+    t_idx = config.data.t_idx
+    num_steps = config.data.num_steps
 
-    ema_decay = config['model']['ema_rate']
-    start_iter = config['training']['start_iter']
-    accum_grad_iter = config['training']['accum_grad_iter']
+    ema_decay = config.model.ema_rate
+    start_iter = config.training.start_iter
+    accum_grad_iter = config.training.accum_grad_iter
 
-    target_num_t = config['model']['num_t'] # number of time steps to predict
-    num_pad = config['model']['num_pad']    # number of steps for padding (Fourier continuation)
+    target_num_t = config.model.num_t # number of time steps to predict
+    num_pad = config.model.num_pad    # number of steps for padding (Fourier continuation)
     total_num_t = target_num_t + num_pad    # number of total time steps
 
-    logname = config['log']['logname']
-    save_step = config['eval']['save_step']
-    use_wandb = config['use_wandb'] if 'use_wandb' in config else False
+    logname = config.log.logname
+    save_step = config.eval.save_step
+    use_wandb = config.use_wandb if 'use_wandb' in config else False
 
     enable_amp = args.amp
     # setup wandb
     if use_wandb and wandb:
-        run = wandb.init(entity=config['log']['entity'],
-                         project=config['log']['project'],
-                         group=config['log']['group'],
+        run = wandb.init(entity=config.log.entity,
+                         project=config.log.project,
+                         group=config.log.group,
                          config=config,
                          reinit=True,
                          settings=wandb.Settings(start_method='fork'))
@@ -92,25 +97,23 @@ def train(model, model_ema,
     # prepare time input
     logsnr_fn = get_logsnr_schedule(logsnr_max, logsnr_min)
 
-    t0, t1 = 1., config['data']['epsilon']
+    t0, t1 = 1., config.data.epsilon
     timesteps = torch.linspace(t0, t1, num_steps + 1)
     idxs = get_idx(t_idx=t_idx, t_dim=t_dim, num_steps=num_steps, 
-                   time_step=config['data']['time_step'])
+                   time_step=config.data.time_step)
 
     timesteps = timesteps[idxs[-total_num_t:]]
     logsnr = logsnr_fn(timesteps).to(device)
     # compute loss weighting
     if loss_weight == 'snr':
-        weights = torch.sqrt(torch.exp(logsnr)).clamp(1.0, 1000.0)
+        weights = torch.sqrt(torch.exp(logsnr)).clamp(1.0, 10000.0)
     else:
         weights = 1.0
-        # print('Default uniform loss weighting')
-    # print(weights)
     # training
     if rank == 0:
-        pbar = tqdm(range(config['training']['n_iters']), dynamic_ncols=True)
+        pbar = tqdm(range(config.training.n_iters), dynamic_ncols=True)
     else:
-        pbar = range(config['training']['n_iters'])
+        pbar = range(config.training.n_iters)
     log_dict = {}
     dataloader = sample_data(dataloader)
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
@@ -196,14 +199,14 @@ def train(model, model_ema,
 def run(train_loader,
         config, args, device, rank=0):
     # create model
-    model_args = dict2namespace(config)
 
-    model = TDDPMm(model_args).to(device)
-    if 'init_ckpt' in config['training']:
-        ckpt_path = config['training']['init_ckpt']
+    model = TDDPMm(config).to(device)
+    if 'init_ckpt' in config.training:
+        ckpt_path = config.training.init_ckpt
+        prepare_pretrain_file(ckpt_path)
         with open(ckpt_path, 'rb') as f:
             ckpt = serialization.from_bytes(target=None, encoded_bytes=f.read())['ema_params']
-            load_from_jax_ckpt(model, ckpt, model_args)
+            load_from_jax_ckpt(model, ckpt, config)
 
     model_ema = copy.deepcopy(model)
     model_ema.eval()
@@ -211,14 +214,16 @@ def run(train_loader,
 
     num_params = count_params(model)
     print(f'number of parameters: {num_params}')
-    config['num_params'] = num_params
+    config.num_params = num_params
 
     # define optimizer and criterion
-    # optimizer = Adam(model.parameters(), lr=config['optim']['lr'])
-    optimizer = apex.optimizers.FusedAdam(model.parameters(), lr=config['optim']['lr'], adam_w_mode=False)
-    scheduler1 = LinearLR(optimizer, start_factor=0.001, total_iters=config['optim']['warmup'])
+    if args.amp and apex is not None:
+        optimizer = apex.optimizers.FusedAdam(model.parameters(), lr=config.optim.lr, adam_w_mode=False)
+    else:
+        optimizer = Adam(model.parameters(), lr=config.optim.lr)
+    scheduler1 = LinearLR(optimizer, start_factor=0.001, total_iters=config.optim.warmup)
     scheduler2 = MultiStepLR(optimizer,
-                             milestones=config['optim']['milestone'],
+                             milestones=config.optim.milestone,
                              gamma=0.5)
     scheduler = ChainedScheduler([scheduler1, scheduler2])
 
@@ -226,7 +231,7 @@ def run(train_loader,
     if args.ckpt:
         ckpt_path = args.ckpt
     else:
-        logname = config['log']['logname']
+        logname = config.log.logname
         base_dir = f'exp/{logname}'
         save_ckpt_dir = os.path.join(base_dir, 'ckpts')
         os.makedirs(save_ckpt_dir, exist_ok=True)
@@ -241,11 +246,11 @@ def run(train_loader,
         print(f'Load optimizer state..')
         scheduler.load_state_dict(ckpt['scheduler'])
         print(f'Load scheduler state..')
-        config['training']['start_iter'] = scheduler._schedulers[0].last_epoch
+        config.training.start_iter = scheduler._schedulers[0].last_epoch
 
     if args.distributed:
         model = DDP(model, device_ids=[device], broadcast_buffers=False)
-    if config['training']['loss'] == 'L1':
+    if config.training.loss == 'L1':
         criterion = weightedL1
     else:
         criterion = weightedL2
@@ -263,29 +268,28 @@ def subprocess_fn(rank, args):
         setup(rank, args.world_size, master_addr=args.master_addr,port=args.port)
     print(f'Running on rank: {rank}')
     
-    with open(args.config, 'r') as f:
-        config = yaml.load(f, yaml.FullLoader)
+    config = OmegaConf.load(args.config)
     # parse configuration file
     
     device = torch.device('cuda')
-    batchsize = config['training']['batchsize']
+    batchsize = config.training.batchsize
     if args.log and rank == 0:
-        config['use_wandb'] = True
+        config.use_wandb = True
     else:
-        config['use_wandb'] = False
+        config.use_wandb = False
 
-    config['seed'] = args.seed
+    config.seed = args.seed
     seed = args.seed
     torch.manual_seed(seed)
     random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    db_path = config['data']['datapath']
+    db_path = config.data.datapath
     trainset = ImageNet(db_path, 
-                        data_shape=config['data']['shape'],
-                        dims=config['data']['dims'],  
-                        t_idx=config['data']['t_idx'])
+                        data_shape=config.data.shape,
+                        dims=config.data.dims,  
+                        t_idx=config.data.t_idx)
 
     train_loader = DataLoader(trainset, batch_size=batchsize,
                               sampler=data_sampler(trainset,
@@ -314,7 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--node_rank', type=int, default=0)
     parser.add_argument('--num_proc_node', type=int, default=1, help='The number of nodes in multi node env.')
     parser.add_argument('--num_gpus_per_node', type=int, default=1)
-    parser.add_argument('--port', type=str, default='8888')
+    parser.add_argument('--port', type=str, default='9039')
     parser.add_argument('--master_addr', type=str, default='localhost')
     parser.add_argument('--amp', action='store_true', help='enable automatic mixed precision')
     args = parser.parse_args()

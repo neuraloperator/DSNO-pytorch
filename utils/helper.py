@@ -1,6 +1,7 @@
 import os
 import re
 import argparse
+import requests
 
 
 def count_params(model):
@@ -36,3 +37,31 @@ def get_latest_ckpt(dir):
     else:
         ckpt_path = os.path.join(dir, f'solver-model_{latest_id}.pt')
         return ckpt_path
+    
+
+'''
+Download pre-trained checkpoints from progressive distillation
+'''
+
+_url_dict = {
+    'cifar_original': 'https://hkzdata.s3.us-west-2.amazonaws.com/SBM/diffusion_distillation/cifar_original', 
+    'imagenet_original': 'https://hkzdata.s3.us-west-2.amazonaws.com/SBM/diffusion_distillation/imagenet_original',
+    'imagenet_16': 'https://hkzdata.s3.us-west-2.amazonaws.com/SBM/diffusion_distillation/imagenet_16',
+    'cifar_8': 'https://hkzdata.s3.us-west-2.amazonaws.com/SBM/diffusion_distillation/cifar_8',
+}
+
+
+def download_file(url, filepath):
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(filepath, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=1024*1024):
+                f.write(chunk)
+
+
+def prepare_pretrain_file(filepath):
+    if not os.path.exists(filepath):
+        model_name = os.path.basename(filepath)
+        url = _url_dict[model_name]
+        print(f'Downloading {model_name} from {url} to {filepath}')
+        download_file(url, filepath)
