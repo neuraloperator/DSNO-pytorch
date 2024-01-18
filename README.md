@@ -11,6 +11,13 @@ Docker:
 - Ensure that NVIDIA container runtime is installed. 
 - Use the Dockerfile in this repo. 
 
+## Generated trajectory data
+- CIFAR10
+    - Trajectories with quadratic time steps: https://dsno.s3.us-west-2.amazonaws.com/cifar_origin/quad.zip
+    - Trajectories with uniform time steps: https://dsno.s3.us-west-2.amazonaws.com/cifar_origin/uniform.zip
+
+- ImageNet64: uniform time steps https://dsno.s3.us-west-2.amazonaws.com/imagenet/imagenet16_data.zip
+
 ## Results
 
 |        | CIFAR10-original data | CIFAR10-DSNO | ImageNet64-original data | ImageNet64-DSNO |
